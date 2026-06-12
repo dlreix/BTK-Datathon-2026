@@ -17,7 +17,8 @@ TECH_COLS = ['coding_score','problem_solving_score','data_structures_score','sql
 CAT_COLS  = ['department','university_tier','target_role','hobby','preferred_social_media_platform']
 BASE_DROP = ['student_id','mentor_feedback_text','career_success_score']
 
-# Yüksek importance'lı türetilmiş feature'lar
+# Türetilmiş feature'lar
+# Not: soft_mean denendi — CV'de -0.45 iyileşti ama LB'de yansımadı (gürültü), geri alındı.
 for df in [train, test]:
     df['tech_score_mean'] = df[TECH_COLS].mean(1)
     df['tech_score_max']  = df[TECH_COLS].max(1)
@@ -25,13 +26,48 @@ for df in [train, test]:
     df['total_experience'] = (df['internship_count'] + df['real_client_project_count'] +
                               df['freelance_project_count'] + df['hackathon_count'])
 
-feat = [c for c in train.columns if c not in BASE_DROP]
+# ── NLP adım 1: mentor_feedback_text üzerinde sözlük (lexicon) tabanlı ton ─────
+# Her metin bağımsız işlenir → leakage yok, tüm-veri pipeline'a doğrudan eklenir.
+POS = ['mükemmel','başarıl','başarıs','etkiley','güçlü','yüksek','yetkin','uzman',
+       'dikkat çek','ön plan','sektör','sahip','büyük','harika','üstün','parlak',
+       'değerli','kaliteli','yeteneğ','yetenek','olumlu','çekici','etkileyici','öne çık']
+NEG = ['gelişim','geliştir','gerekiyor','gerekli','gerektiğ','ancak','fakat','eksik',
+       'zayıf','daha fazla','yetersiz','sınırlı','iyileştir','gözlemleniyor','rağmen',
+       'olacaktır','çalışması','üzerinde çalış','ihtiyac','geliştirme']
+
+for df in [train, test]:
+    t = df['mentor_feedback_text'].fillna('').str.lower()
+    df['text_pos'] = sum(t.str.count(w) for w in POS)
+    df['text_neg'] = sum(t.str.count(w) for w in NEG)
+    df['text_sentiment']  = df['text_pos'] - df['text_neg']
+    df['text_sent_ratio'] = df['text_sentiment'] / (df['text_pos'] + df['text_neg'] + 1)
 
 # ── KRİTİK: Random 5-fold (sıralama YOK) ──────────────────────────────────────
 # Her fold tüm veriden örnek alır → her model tüm yılları (2019-2026) görür.
 # Bu, submission_06'nın LB 93.57 veren üretim yöntemi.
 # Temporal fold (eksik veriyle eğitim) submission'da LB'yi bozuyordu — onu kullanmıyoruz.
 kf = KFold(n_splits=5, shuffle=True, random_state=42)
+
+# ── NLP adım 3: emrecan (Türkçe-özel) embeddings + Ridge stacking ─────────────
+# emrecan/bert-base-turkish-cased-mean-nli-stsb-tr cache'den, 768 boyut.
+# mpnet (çok-dilli) denendi: CV'de daha iyiydi (76.75) ama LB'de KÖTÜ (86.89 vs 86.63)
+# → küçük CV farkı gürültü; emrecan en iyi kaldı (sub_13).
+# Stacking: ana fold'larla AYNI kf → her train satırı kendi dışındaki veriyle
+# tahmin edilir (leakage yok). 768 boyut → tek skalar text_embed_pred.
+from sklearn.linear_model import Ridge
+emb_tr = np.load('embed_train.npy')
+emb_te = np.load('embed_test.npy')
+oof_embed  = np.zeros(len(train))
+test_embed = np.zeros(len(test))
+for tr_i, va_i in kf.split(emb_tr):
+    r = Ridge(alpha=10.0)
+    r.fit(emb_tr[tr_i], y[tr_i])
+    oof_embed[va_i] = r.predict(emb_tr[va_i])
+    test_embed     += r.predict(emb_te) / kf.n_splits
+train['text_embed_pred'] = oof_embed
+test['text_embed_pred']  = test_embed
+
+feat = [c for c in train.columns if c not in BASE_DROP]
 
 # ── LightGBM (native category) ────────────────────────────────────────────────
 Xl  = train[feat].copy()
@@ -90,6 +126,6 @@ print(f"\nEn iyi blend: LGB={best_w:.2f} CB={1-best_w:.2f}  →  random CV {best
 # ── Submission ────────────────────────────────────────────────────────────────
 final = np.clip(best_w * tp_lgb + (1 - best_w) * tp_cb, 0, 100)
 pd.DataFrame({'student_id': test['student_id'], 'career_success_score': final}).to_csv(
-    'submission_10_fulldata_blend.csv', index=False)
-print("\nsubmission_10_fulldata_blend.csv kaydedildi.")
+    'submission_13_embeddings.csv', index=False)
+print("\nsubmission_13_embeddings.csv kaydedildi.")
 print(pd.Series(final).describe().round(2).to_string())
